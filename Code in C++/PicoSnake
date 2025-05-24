@@ -1,0 +1,305 @@
+#include "pico/stdlib.h"
+#include "hardware/i2c.h"
+#include "hardware/pwm.h"
+#include "hardware/gpio.h"
+#include "pico_extras/ssd1306.h"
+
+#include <vector>
+#include <cstdlib>
+#include <ctime>
+#include <algorithm>
+#include <cstdio>
+
+using namespace std;
+
+// Screen parameters
+constexpr uint8_t SCREEN_WIDTH = 128;
+constexpr uint8_t SCREEN_HEIGHT = 64;
+constexpr uint8_t SEGMENT_WIDTH = 8;
+constexpr uint8_t SEGMENT_PIXELS = SEGMENT_WIDTH;
+constexpr uint8_t SEGMENTS_HIGH = SCREEN_HEIGHT / SEGMENT_PIXELS;
+constexpr uint8_t SEGMENTS_WIDE = SCREEN_WIDTH / SEGMENT_PIXELS;
+
+// I2C pins
+#define I2C_PORT i2c1
+#define PIN_SDA 14
+#define PIN_SCL 15
+
+// Buttons
+#define BTN_UP 2
+#define BTN_DOWN 3
+#define BTN_LEFT 4
+#define BTN_RIGHT 5
+#define BTN_1 6
+#define BTN_2 7
+
+// Buzzer PWM pin
+#define BUZZER_PIN 18
+
+// Forward declaration of timer function
+bool repeating_timer_callback(struct repeating_timer *t);
+
+class Snake {
+public:
+    enum Direction {UP = 0, DOWN = 1, LEFT = 2, RIGHT = 3};
+
+    Snake() {
+        reset();
+    }
+
+    void reset() {
+        segments.clear();
+        segments.push_back({SEGMENTS_WIDE/2, SEGMENTS_HIGH/2 + 1});
+        dir = static_cast<Direction>(rand() % 4);
+        alive = true;
+        x = segments.back().first;
+        y = segments.back().second;
+    }
+
+    void move() {
+        int new_x = x;
+        int new_y = y;
+        switch(dir) {
+            case UP:    new_y--; break;
+            case DOWN:  new_y++; break;
+            case LEFT:  new_x--; break;
+            case RIGHT: new_x++; break;
+        }
+
+        // Shift segments positions
+        for(size_t i=0; i < segments.size() - 1; i++) {
+            segments[i] = segments[i+1];
+        }
+
+        if (check_crash(new_x, new_y)) {
+            if (alive) {
+                // Ugly sound for crash
+                buzz(200, 500); // 200Hz, 500ms
+            }
+            alive = false;
+        }
+
+        x = new_x;
+        y = new_y;
+        segments.back() = {x, y};
+    }
+
+    void eat() {
+        // Add new segment at current position
+        segments.push_back({x, y});
+        // Eat sound
+        buzz(1000, 100);
+    }
+
+    bool change_dir(Direction new_dir) {
+        // Prevent reversing direction
+        if ((new_dir == DOWN && dir == UP) ||
+            (new_dir == UP && dir == DOWN) ||
+            (new_dir == RIGHT && dir == LEFT) ||
+            (new_dir == LEFT && dir == RIGHT)) {
+            return false;
+        }
+        dir = new_dir;
+        return true;
+    }
+
+    void draw(SSD1306 &display) {
+        // Draw last segment as a rectangle
+        auto &seg = segments.back();
+        display.rect(seg.first * SEGMENT_PIXELS, seg.second * SEGMENT_PIXELS, SEGMENT_PIXELS, SEGMENT_PIXELS, 1);
+    }
+
+    bool is_alive() { return alive; }
+
+    const vector<pair<int,int>>& get_segments() { return segments; }
+
+    int get_x() { return x; }
+    int get_y() { return y; }
+
+private:
+    vector<pair<int,int>> segments;
+    Direction dir;
+    bool alive;
+    int x, y;
+
+    bool check_crash(int nx, int ny) {
+        if (nx < 0 || ny < 0 || nx >= SEGMENTS_WIDE || ny >= SEGMENTS_HIGH)
+            return true;
+        for (auto &seg : segments) {
+            if (seg.first == nx && seg.second == ny)
+                return true;
+        }
+        return false;
+    }
+
+    void buzz(uint16_t freq, uint16_t duration_ms) {
+        // Setup PWM for buzzer
+        gpio_set_function(BUZZER_PIN, GPIO_FUNC_PWM);
+        uint slice_num = pwm_gpio_to_slice_num(BUZZER_PIN);
+        pwm_config config = pwm_get_default_config();
+        pwm_config_set_clkdiv(&config, 125.0f); // slow down clock for audible freq
+        pwm_init(slice_num, &config, true);
+
+        // Calculate wrap and level for frequency
+        uint32_t clock_freq = 125000000; // 125 MHz system clock
+        uint32_t wrap = clock_freq / freq / 125;
+        pwm_set_wrap(slice_num, wrap);
+        pwm_set_gpio_level(BUZZER_PIN, wrap / 2); // 50% duty cycle
+
+        sleep_ms(duration_ms);
+
+        // Turn off PWM
+        pwm_set_gpio_level(BUZZER_PIN, 0);
+        pwm_set_enabled(slice_num, false);
+        gpio_set_function(BUZZER_PIN, GPIO_FUNC_SIO); // reset pin function
+    }
+};
+
+// Globals
+SSD1306 display(I2C_PORT, 0x3C, SCREEN_WIDTH, SCREEN_HEIGHT);
+Snake player;
+pair<int,int> food;
+
+vector<pair<int,int>> valid_range;
+
+void draw_food() {
+    display.fill_rect(food.first * SEGMENT_PIXELS, food.second * SEGMENT_PIXELS, SEGMENT_PIXELS, SEGMENT_PIXELS, 1);
+}
+
+void clear_food() {
+    display.fill_rect(food.first * SEGMENT_PIXELS, food.second * SEGMENT_PIXELS, SEGMENT_PIXELS, SEGMENT_PIXELS, 0);
+}
+
+pair<int,int> random_food() {
+    vector<pair<int,int>> candidates;
+    for(auto &pos : valid_range) {
+        if(find(player.get_segments().begin(), player.get_segments().end(), pos) == player.get_segments().end()) {
+            candidates.push_back(pos);
+        }
+    }
+    if (candidates.empty()) return {-1, -1}; // no space left?
+    int idx = rand() % candidates.size();
+    return candidates[idx];
+}
+
+void update_game() {
+    // Erase tail
+    auto tail = player.get_segments()[0];
+    display.fill_rect(tail.first * SEGMENT_PIXELS, tail.second * SEGMENT_PIXELS, SEGMENT_PIXELS, SEGMENT_PIXELS, 0);
+
+    player.move();
+
+    if (player.is_alive()) {
+        if (player.get_x() == food.first && player.get_y() == food.second) {
+            player.eat();
+            clear_food();
+            food = random_food();
+            draw_food();
+        }
+        player.draw(display);
+    }
+
+    display.display();
+}
+
+int main() {
+    // Init stdio (for debugging)
+    stdio_init_all();
+
+    // Init I2C
+    i2c_init(I2C_PORT, 400000);
+    gpio_set_function(PIN_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(PIN_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(PIN_SDA);
+    gpio_pull_up(PIN_SCL);
+
+    // Init display
+    display.init();
+    display.clear();
+    display.display();
+
+    // Init buttons as inputs with pull-up
+    gpio_init(BTN_UP);
+    gpio_set_dir(BTN_UP, GPIO_IN);
+    gpio_pull_up(BTN_UP);
+
+    gpio_init(BTN_DOWN);
+    gpio_set_dir(BTN_DOWN, GPIO_IN);
+    gpio_pull_up(BTN_DOWN);
+
+    gpio_init(BTN_LEFT);
+    gpio_set_dir(BTN_LEFT, GPIO_IN);
+    gpio_pull_up(BTN_LEFT);
+
+    gpio_init(BTN_RIGHT);
+    gpio_set_dir(BTN_RIGHT, GPIO_IN);
+    gpio_pull_up(BTN_RIGHT);
+
+    gpio_init(BTN_1);
+    gpio_set_dir(BTN_1, GPIO_IN);
+    gpio_pull_up(BTN_1);
+
+    gpio_init(BTN_2);
+    gpio_set_dir(BTN_2, GPIO_IN);
+    gpio_pull_up(BTN_2);
+
+    // Initialize random seed
+    srand(time(NULL));
+
+    // Build valid range
+    for (int i = 0; i < SEGMENTS_WIDE * SEGMENTS_HIGH; i++) {
+        valid_range.push_back({i / SEGMENTS_HIGH, i % SEGMENTS_HIGH});
+    }
+
+    // Reset game
+    player.reset();
+    food = random_food();
+    draw_food();
+
+    display.display();
+
+    // Game loop timer - we run update_game() every 200ms
+    absolute_time_t next_update = get_absolute_time();
+
+    while (true) {
+        // Read buttons and update direction if alive
+        if (player.is_alive()) {
+            if (gpio_get(BTN_UP) == 0)
+                player.change_dir(Snake::UP);
+            else if (gpio_get(BTN_RIGHT) == 0)
+                player.change_dir(Snake::RIGHT);
+            else if (gpio_get(BTN_LEFT) == 0)
+                player.change_dir(Snake::LEFT);
+            else if (gpio_get(BTN_DOWN) == 0)
+                player.change_dir(Snake::DOWN);
+        } else {
+            // Game over screen
+            display.clear();
+            char buf[32];
+            const char* game_over = "Game Over!";
+            int x = (SCREEN_WIDTH / 2) - (strlen(game_over) / 2 * 8);
+            display.text(x, SCREEN_HEIGHT / 2 - 8, game_over, 1);
+            snprintf(buf, sizeof(buf), "Length: %d", (int)player.get_segments().size());
+            x = (SCREEN_WIDTH / 2) - (strlen(buf) / 2 * 8);
+            display.text(x, SCREEN_HEIGHT / 2 + 16, buf, 1);
+            display.display();
+
+            // Wait for any button press to restart or exit
+            while (gpio_get(BTN_RIGHT) != 0 && gpio_get(BTN_LEFT) != 0 && gpio_get(BTN_1) != 0 && gpio_get(BTN_2) != 0) {
+                sleep_ms(1);
+            }
+            break;
+        }
+
+        // Update game every 200ms
+        if (absolute_time_diff_us(get_absolute_time(), next_update) <= 0) {
+            update_game();
+            next_update = make_timeout_time_ms(200);
+        }
+
+        // small delay to avoid busy wait
+        sleep_ms(10);
+    }
+
+    return 0;
+}

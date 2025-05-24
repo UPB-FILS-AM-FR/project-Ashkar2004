@@ -1,0 +1,206 @@
+#include <stdio.h>
+#include "pico/stdlib.h"
+#include "hardware/pwm.h"
+#include "hardware/i2c.h"
+#include "ssd1306.h"  // Your SSD1306 library header
+
+// Pin definitions
+#define PIN_UP 2
+#define PIN_DOWN 3
+#define PIN_LEFT 4
+#define PIN_RIGHT 5
+#define PIN_BUTTON1 6
+#define PIN_BUTTON2 7
+#define PIN_BUZZER 18
+#define I2C_PORT i2c1
+#define SDA_PIN 14
+#define SCL_PIN 15
+
+// Screen parameters
+const int SCREEN_WIDTH = 128;
+const int SCREEN_HEIGHT = 64;
+const int BALL_SIZE = SCREEN_WIDTH / 32;
+const int PADDLE_WIDTH = SCREEN_WIDTH / 8;
+const int PADDLE_HEIGHT = SCREEN_HEIGHT / 16;
+const int PADDLE_Y = SCREEN_HEIGHT - 2 * PADDLE_HEIGHT;
+
+// Function prototypes
+void init_gpio();
+void init_i2c();
+void init_buzzer();
+void set_buzzer_freq(uint freq);
+bool is_button_pressed(uint pin);
+
+int main() {
+    stdio_init_all();
+
+    init_gpio();
+    init_i2c();
+
+    ssd1306_t oled;
+    ssd1306_init(&oled, SCREEN_WIDTH, SCREEN_HEIGHT, I2C_PORT, SDA_PIN, SCL_PIN);
+
+    // Buzzer setup
+    init_buzzer();
+    uint slice_num = pwm_gpio_to_slice_num(PIN_BUZZER);
+
+    // Game variables
+    float ballX = 64.0f;
+    float ballY = 0.0f;
+    float ballVX = 1.0f;
+    float ballVY = 1.0f;
+
+    int paddleX = SCREEN_WIDTH / 2;
+    int paddleVX = 6;
+
+    int soundFreq = 400;
+    int score = 0;
+
+    while (true) {
+        // Handle paddle movement
+        if (!gpio_get(PIN_RIGHT)) {
+            paddleX += paddleVX;
+            if (paddleX + PADDLE_WIDTH > SCREEN_WIDTH) paddleX = SCREEN_WIDTH - PADDLE_WIDTH;
+        } else if (!gpio_get(PIN_LEFT)) {
+            paddleX -= paddleVX;
+            if (paddleX < 0) paddleX = 0;
+        }
+
+        // Prevent infinite vertical trajectory
+        if (fabs(ballVX) < 1.0f) {
+            ballVX = (ballVX < 0) ? -1.0f : 1.0f;
+        }
+
+        ballX += ballVX;
+        ballY += ballVY;
+
+        bool collision = false;
+
+        // Collisions
+        if (ballX < 0) {
+            ballX = 0;
+            ballVX = -ballVX;
+            collision = true;
+        }
+        if (ballX + BALL_SIZE > SCREEN_WIDTH) {
+            ballX = SCREEN_WIDTH - BALL_SIZE;
+            ballVX = -ballVX;
+            collision = true;
+        }
+
+        if (ballY + BALL_SIZE > PADDLE_Y &&
+            ballX > paddleX - BALL_SIZE &&
+            ballX < paddleX + PADDLE_WIDTH + BALL_SIZE) {
+            // Paddle collision
+            ballVY = -ballVY;
+            ballY = PADDLE_Y - BALL_SIZE;
+            ballVY -= 0.2f;
+            ballVX += (ballX - (paddleX + PADDLE_WIDTH / 2)) / 10.0f;
+            collision = true;
+            score += 10;
+        }
+
+        if (ballY < 0) {
+            ballY = 0;
+            ballVY = -ballVY;
+            collision = true;
+        }
+
+        if (ballY + BALL_SIZE > SCREEN_HEIGHT) {
+            // Game over
+            ssd1306_clear(&oled);
+            ssd1306_draw_text(&oled, SCREEN_WIDTH / 2 - (strlen("GAME OVER") * 8) / 2, SCREEN_HEIGHT / 2 - 8, "GAME OVER");
+            char score_str[16];
+            snprintf(score_str, sizeof(score_str), "%d", score);
+            ssd1306_draw_text(&oled, SCREEN_WIDTH - strlen(score_str) * 8, 0, score_str);
+            ssd1306_show(&oled);
+
+            // Play sound
+            set_buzzer_freq(200);
+            pwm_set_gpio_level(PIN_BUZZER, 2000);
+            sleep_ms(500);
+            pwm_set_gpio_level(PIN_BUZZER, 0);
+
+            // Wait for button press
+            while (gpio_get(PIN_RIGHT) && gpio_get(PIN_LEFT) && gpio_get(PIN_BUTTON1) && gpio_get(PIN_BUTTON2)) {
+                sleep_ms(1);
+            }
+            break;
+        }
+
+        // Sound on collision
+        if (collision) {
+            soundFreq = (soundFreq == 400) ? 800 : 400;
+            set_buzzer_freq(soundFreq);
+            pwm_set_gpio_level(PIN_BUZZER, 2000);
+        } else {
+            pwm_set_gpio_level(PIN_BUZZER, 0);
+        }
+
+        // Draw game objects
+        ssd1306_clear(&oled);
+        ssd1306_fill_rect(&oled, paddleX, PADDLE_Y, PADDLE_WIDTH, PADDLE_HEIGHT, 1);
+        ssd1306_fill_rect(&oled, (int)ballX, (int)ballY, BALL_SIZE, BALL_SIZE, 1);
+
+        char score_buf[16];
+        snprintf(score_buf, sizeof(score_buf), "%d", score);
+        ssd1306_draw_text(&oled, SCREEN_WIDTH - strlen(score_buf) * 8, 0, score_buf);
+
+        ssd1306_show(&oled);
+
+        sleep_ms(1);
+    }
+
+    return 0;
+}
+
+void init_gpio() {
+    gpio_init(PIN_UP);
+    gpio_set_dir(PIN_UP, GPIO_IN);
+    gpio_pull_up(PIN_UP);
+
+    gpio_init(PIN_DOWN);
+    gpio_set_dir(PIN_DOWN, GPIO_IN);
+    gpio_pull_up(PIN_DOWN);
+
+    gpio_init(PIN_LEFT);
+    gpio_set_dir(PIN_LEFT, GPIO_IN);
+    gpio_pull_up(PIN_LEFT);
+
+    gpio_init(PIN_RIGHT);
+    gpio_set_dir(PIN_RIGHT, GPIO_IN);
+    gpio_pull_up(PIN_RIGHT);
+
+    gpio_init(PIN_BUTTON1);
+    gpio_set_dir(PIN_BUTTON1, GPIO_IN);
+    gpio_pull_up(PIN_BUTTON1);
+
+    gpio_init(PIN_BUTTON2);
+    gpio_set_dir(PIN_BUTTON2, GPIO_IN);
+    gpio_pull_up(PIN_BUTTON2);
+}
+
+void init_i2c() {
+    i2c_init(I2C_PORT, 400000);
+    gpio_set_function(SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(SDA_PIN);
+    gpio_pull_up(SCL_PIN);
+}
+
+void init_buzzer() {
+    gpio_set_function(PIN_BUZZER, GPIO_FUNC_PWM);
+    uint slice_num = pwm_gpio_to_slice_num(PIN_BUZZER);
+    pwm_set_wrap(slice_num, 65535);
+    pwm_set_chan_level(slice_num, PWM_CHAN_A, 0);
+    pwm_set_enabled(slice_num, true);
+}
+
+void set_buzzer_freq(uint freq) {
+    uint slice_num = pwm_gpio_to_slice_num(PIN_BUZZER);
+    uint32_t clock = 125000000; // 125 MHz
+    uint32_t divider16 = clock / (freq * 65536) + 1;
+    uint32_t wrap = (clock * 16) / (freq * divider16);
+    pwm_set_clkdiv_int_frac(slice_num, divider16 / 16, divider16 & 0xF);
+    pwm_set_wrap(slice_num, wrap);
+}
